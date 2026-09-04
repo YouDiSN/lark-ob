@@ -1,0 +1,7 @@
+.env
+.DS_Store
+data/
+bin/
+internal/server/ui/node_modules/
+internal/server/ui/dist/
+internal/server/ui/*.tsbuildinfo
