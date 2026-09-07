@@ -1,0 +1,16 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+!.env.docker.example
+bin
+data
+*.db
+*.db-shm
+*.db-wal
+internal/server/ui/node_modules
+internal/server/ui/dist
+coverage
+*.log
+.codex

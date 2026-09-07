@@ -1,0 +1,35 @@
+services:
+  lark-ob:
+    image: lark-ob:local
+    container_name: lark-ob
+    build:
+      context: .
+      args:
+        LARK_CLI_VERSION: ${LARK_CLI_VERSION:-1.0.93}
+    # The current Agent proxy only listens on host localhost. Host networking
+    # keeps both services private while allowing the container to reach it.
+    network_mode: host
+    restart: unless-stopped
+    stop_grace_period: 30s
+    env_file:
+      - ${LARK_OB_ENV_FILE:-.env.docker}
+    environment:
+      HOME: /home/node
+      XDG_CACHE_HOME: /cache
+      LARK_CLI_PATH: /usr/local/bin/lark-cli
+    volumes:
+      - ${HOME}/.local/share/lark-ob:/data
+      - ${HOME}/.cache/lark-ob:/cache/lark-ob
+      - ${HOME}/.lark-cli:/home/node/.lark-cli
+      - ${HOME}/.local/share/lark-cli:/home/node/.local/share/lark-cli
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8765/api/status"]
+      interval: 20s
+      timeout: 5s
+      start_period: 20s
+      retries: 3

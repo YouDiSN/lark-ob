@@ -148,7 +148,18 @@ func (c *Client) Messages(ctx context.Context, token, chatID string) ([]model.Me
 }
 
 func (c *Client) MessagesPage(ctx context.Context, token, chatID, pageToken string) ([]model.Message, string, bool, error) {
+	return c.messagesPage(ctx, token, chatID, pageToken, time.Time{})
+}
+
+func (c *Client) MessagesPageSince(ctx context.Context, token, chatID, pageToken string, since time.Time) ([]model.Message, string, bool, error) {
+	return c.messagesPage(ctx, token, chatID, pageToken, since)
+}
+
+func (c *Client) messagesPage(ctx context.Context, token, chatID, pageToken string, since time.Time) ([]model.Message, string, bool, error) {
 	q := url.Values{"container_id_type": {"chat"}, "container_id": {chatID}, "sort_type": {"ByCreateTimeDesc"}, "page_size": {"50"}, "with_sender_name": {"true"}, "only_thread_root_messages": {"true"}}
+	if !since.IsZero() {
+		q.Set("start_time", strconv.FormatInt(since.Unix(), 10))
+	}
 	if pageToken != "" {
 		q.Set("page_token", pageToken)
 	}
@@ -170,6 +181,11 @@ func (c *Client) MessagesPage(ctx context.Context, token, chatID, pageToken stri
 					SenderType string `json:"sender_type"`
 					Name       string `json:"sender_name"`
 				} `json:"sender"`
+				Mentions []struct {
+					ID   string `json:"id"`
+					Key  string `json:"key"`
+					Name string `json:"name"`
+				} `json:"mentions"`
 			} `json:"items"`
 		} `json:"data"`
 	}
@@ -183,7 +199,11 @@ func (c *Client) MessagesPage(ctx context.Context, token, chatID, pageToken stri
 	for _, x := range out.Data.Items {
 		ts, _ := strconv.ParseInt(x.CreateTime, 10, 64)
 		content := decodeContent(x.MsgType, x.Body.Content)
-		result = append(result, model.Message{ID: x.MessageID, ChatID: chatID, SenderID: x.Sender.ID, SenderName: x.Sender.Name, Content: content, Type: x.MsgType, CreatedAt: ts})
+		mentions := make([]model.Mention, 0, len(x.Mentions))
+		for _, mention := range x.Mentions {
+			mentions = append(mentions, model.Mention{ID: mention.ID, Key: mention.Key, Name: mention.Name})
+		}
+		result = append(result, model.Message{ID: x.MessageID, ChatID: chatID, SenderID: x.Sender.ID, SenderName: x.Sender.Name, Content: content, Type: x.MsgType, CreatedAt: ts, Mentions: mentions})
 	}
 	return result, out.Data.PageToken, out.Data.HasMore, nil
 }

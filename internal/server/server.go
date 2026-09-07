@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
@@ -10,12 +11,21 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/youdisn/lark-ob/internal/agent"
+	"github.com/youdisn/lark-ob/internal/impression"
+	"github.com/youdisn/lark-ob/internal/initializer"
+	"github.com/youdisn/lark-ob/internal/knowledge"
 	"github.com/youdisn/lark-ob/internal/lark"
+	"github.com/youdisn/lark-ob/internal/maintenance"
+	"github.com/youdisn/lark-ob/internal/media"
+	"github.com/youdisn/lark-ob/internal/memory"
 	"github.com/youdisn/lark-ob/internal/model"
+	"github.com/youdisn/lark-ob/internal/profile"
 	"github.com/youdisn/lark-ob/internal/store"
 	"github.com/youdisn/lark-ob/internal/syncer"
 )
@@ -24,18 +34,36 @@ import (
 var uiFiles embed.FS
 
 type Server struct {
-	store      *store.Store
-	lark       *lark.Client
-	syncer     *syncer.Syncer
-	stateMu    sync.Mutex
-	oauthState string
-	clientsMu  sync.Mutex
-	clients    map[chan struct{}]struct{}
+	store       *store.Store
+	lark        *lark.Client
+	syncer      *syncer.Syncer
+	knowledge   *knowledge.Service
+	agent       *agent.Engine
+	memories    *memory.Service
+	initializer *initializer.Service
+	profiles    *profile.Service
+	impressions *impression.Service
+	maintenance *maintenance.Service
+	media       *media.Service
+	stateMu     sync.Mutex
+	oauthState  string
+	clientsMu   sync.Mutex
+	clients     map[chan struct{}]struct{}
 }
 
-func New(st *store.Store, lc *lark.Client, sy *syncer.Syncer) *Server {
-	s := &Server{store: st, lark: lc, syncer: sy, clients: map[chan struct{}]struct{}{}}
+func New(st *store.Store, lc *lark.Client, sy *syncer.Syncer, ks *knowledge.Service, ae *agent.Engine, memories *memory.Service, init *initializer.Service, profiles *profile.Service, impressions *impression.Service, maintenance *maintenance.Service, mediaService *media.Service) *Server {
+	s := &Server{store: st, lark: lc, syncer: sy, knowledge: ks, agent: ae, memories: memories, initializer: init, profiles: profiles,
+		impressions: impressions, maintenance: maintenance, media: mediaService, clients: map[chan struct{}]struct{}{}}
 	sy.SetNotify(s.broadcast)
+	if profiles != nil {
+		profiles.SetNotify(s.broadcast)
+	}
+	if init != nil {
+		init.SetNotify(s.broadcast)
+	}
+	if maintenance != nil {
+		maintenance.SetNotify(s.broadcast)
+	}
 	return s
 }
 
@@ -46,7 +74,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/chats/{id}/messages", s.messages)
 	mux.HandleFunc("GET /api/chats/{id}/history", s.history)
 	mux.HandleFunc("POST /api/chats/{id}/history", s.loadHistory)
+	mux.HandleFunc("POST /api/chats/{id}/refresh", s.refreshChat)
+	mux.HandleFunc("POST /api/chats/{id}/viewed", s.markChatViewed)
+	mux.HandleFunc("POST /api/chats/read-all", s.markAllChatsViewed)
+	mux.HandleFunc("PATCH /api/chats/{id}/preferences", s.updateChatPreferences)
+	mux.HandleFunc("GET /api/messages/{id}/images/{key}", s.messageImage)
 	mux.HandleFunc("POST /api/sync", s.syncNow)
+	s.registerKnowledgeRoutes(mux)
+	s.registerAgentRoutes(mux)
 	mux.HandleFunc("GET /api/events", s.events)
 	mux.HandleFunc("GET /auth/lark", s.authStart)
 	mux.HandleFunc("GET /auth/lark/callback", s.authCallback)
@@ -90,6 +125,9 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 	if v == nil {
 		v = []model.Message{}
 	}
+	if s.profiles != nil {
+		s.profiles.Enqueue(v)
+	}
 	writeJSON(w, v)
 }
 func (s *Server) history(w http.ResponseWriter, r *http.Request) {
@@ -102,6 +140,105 @@ func (s *Server) loadHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"loaded": count, "hasMore": state.HasMore})
+}
+func (s *Server) refreshChat(w http.ResponseWriter, r *http.Request) {
+	result, err := s.syncer.SyncChat(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeError(w, err, http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, result)
+}
+func (s *Server) markChatViewed(w http.ResponseWriter, r *http.Request) {
+	if err := s.store.MarkChatViewed(r.Context(), r.PathValue("id")); err != nil {
+		if err == sql.ErrNoRows {
+			writeError(w, fmt.Errorf("会话不存在"), http.StatusNotFound)
+			return
+		}
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	s.broadcast()
+	writeJSON(w, map[string]bool{"ok": true})
+}
+func (s *Server) markAllChatsViewed(w http.ResponseWriter, r *http.Request) {
+	updated, err := s.store.MarkAllChatsViewed(r.Context())
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	s.broadcast()
+	writeJSON(w, map[string]any{"ok": true, "updated": updated})
+}
+func (s *Server) updateChatPreferences(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		Muted        *bool `json:"muted"`
+		InMessageBox *bool `json:"inMessageBox"`
+	}
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		writeError(w, fmt.Errorf("无效的会话状态: %w", err), http.StatusBadRequest)
+		return
+	}
+	if err := s.store.SetChatPreferences(r.Context(), r.PathValue("id"), request.Muted, request.InMessageBox); err != nil {
+		switch {
+		case err == sql.ErrNoRows:
+			writeError(w, fmt.Errorf("会话不存在"), http.StatusNotFound)
+		case strings.Contains(err.Error(), "只有群聊") || strings.Contains(err.Error(), "至少需要"):
+			writeError(w, err, http.StatusBadRequest)
+		default:
+			writeError(w, err, http.StatusInternalServerError)
+		}
+		return
+	}
+	if request.InMessageBox != nil && *request.InMessageBox && s.memories != nil {
+		if _, err := s.memories.ReplaceChat(r.Context(), r.PathValue("id"), nil); err != nil {
+			writeError(w, fmt.Errorf("会话已移入消息盒子，但清理已有记忆失败: %w", err), http.StatusInternalServerError)
+			return
+		}
+		if err := s.store.InvalidateDerivedProfilesForChat(r.Context(), r.PathValue("id")); err != nil {
+			writeError(w, fmt.Errorf("会话已移入消息盒子，但清理关联印象失败: %w", err), http.StatusInternalServerError)
+			return
+		}
+	}
+	chat, err := s.store.Chat(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	s.broadcast()
+	writeJSON(w, chat)
+}
+func (s *Server) messageImage(w http.ResponseWriter, r *http.Request) {
+	if s.media == nil {
+		writeError(w, fmt.Errorf("图片服务未启用"), http.StatusServiceUnavailable)
+		return
+	}
+	path, contentType, err := s.media.Image(r.Context(), r.PathValue("id"), r.PathValue("key"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.NotFound(w, r)
+			return
+		}
+		writeError(w, err, http.StatusBadGateway)
+		return
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "private, max-age=86400")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	http.ServeContent(w, r, "", info.ModTime(), file)
 }
 func (s *Server) syncNow(w http.ResponseWriter, r *http.Request) {
 	go s.syncer.Sync(context.Background())
