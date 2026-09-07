@@ -4,6 +4,25 @@
 
 > 本仓库只接受真实飞书数据，不内置假会话、Mock 消息或演示数据。当前开发机已经通过个人 `lark-cli` 授权完成真实消息链路验证；授权和本地数据库均留在仓库之外。
 
+## 快速入口
+
+- 第一次了解项目：阅读[背景与目标](#背景与目标)、[架构](#架构)和[模块边界](#模块边界)。
+- 在 Linux 服务器部署：直接阅读[Docker 部署（推荐）](#docker-部署推荐)。
+- 修改代码：阅读[开发与修复指南](#开发与修复指南)。
+- 页面打不开、授权失败或 Agent 异常：阅读[常见故障排查](#常见故障排查)。
+- 处理真实数据前：阅读[数据安全与备份](#数据安全与备份)和[安全原则](#安全原则)。
+
+已配置好 `.env.docker` 和 `lark-cli` 授权的机器，可以用下面四条命令启动：
+
+```bash
+docker-compose build
+docker-compose up -d
+docker-compose ps
+curl --fail http://127.0.0.1:8765/api/status
+```
+
+正常情况下容器状态应为 `healthy`，页面地址为 <http://127.0.0.1:8765>。
+
 ## 背景与目标
 
 用户每天会同时收到多个单聊和群聊消息，需要逐个打开上下文、查找个人知识库并组织回复。期望最终形成一个命令行工具：
@@ -110,6 +129,46 @@
 - 历史回溯：用户打开会话后按 `page_token` 向前加载，直到 `has_more=false`。
 - 防漏：后续需要增加低频全量对账任务，目前尚未实现。
 
+### 一条新消息的处理链路
+
+```text
+lark-cli 用户授权
+        │
+        ▼
+syncer 增量轮询 ──► SQLite 幂等写入 ──► SSE 通知页面刷新
+        │                    │
+        │                    ├──► 更新会话排序、未读和 @我状态
+        │                    └──► enqueue 独立 chat context
+        ▼
+每日维护任务 ──► 自动记忆 / 人物印象 / 自我与关系风格
+                             │
+用户点击推荐回复             ▼
+        └──► 最近消息 + chat context + 有效记忆 + 知识库 + 风格
+                                      │
+                                      ▼
+                              Eino / Grok 候选回复
+```
+
+推荐回复阶段不会重新扫描完整历史。较重的会话理解、记忆和人物印象在初始化、新消息处理或每日任务中提前生成，因此每个会话都有独立、持久化的 Agent 上下文。
+
+### 模块边界
+
+| 模块 | 职责 | 不负责 |
+| --- | --- | --- |
+| `internal/larkcli` | 调用官方 CLI、解析用户身份数据、资料和媒体 | 业务记忆、页面状态 |
+| `internal/syncer` | 会话发现、增量轮询、历史分页、消息入库 | Agent 推理、知识库 |
+| `internal/store` | SQLite schema、迁移、查询和事务 | 业务编排、模型调用 |
+| `internal/initializer` | 最近 30 天首次历史和记忆初始化 | 每日增量维护 |
+| `internal/maintenance` | 每日同步、记忆、印象和风格维护 | HTTP 请求处理 |
+| `internal/memory` | 自动/手动记忆、有效期、衰减、检索优先级 | 人物表达风格 |
+| `internal/impression` | 人物基础印象、个人及关系表达风格 | 确定性事实存储 |
+| `internal/knowledge` | 用户指定文档导入、切分、索引和检索 | 自动扫描全部云文档 |
+| `internal/agent` | Eino 编排、chat context、摘要和回复候选 | 数据所有权、自动发送 |
+| `internal/server` | HTTP API、SSE、嵌入 React 静态资源 | 飞书协议细节 |
+| `internal/server/ui` | 收件箱、聊天、知识库、记忆和推荐回复 UI | 直接访问飞书或数据库 |
+
+增加功能时应把逻辑放进所属模块，通过接口组合；不要把同步、数据库 SQL、模型 Prompt 和 HTTP handler 堆在同一个文件中。
+
 ## Docker 部署（推荐）
 
 当前 Linux 部署推荐使用 Docker Compose。镜像内包含编译后的 Go 服务、React 静态资源、Node.js 和固定版本的 `lark-cli`；聊天数据库、图片缓存和用户授权留在宿主机，不会打进镜像。
@@ -143,6 +202,14 @@ docker-compose build
 docker-compose up -d
 docker-compose ps
 docker-compose logs -f lark-ob
+```
+
+也可以使用 Makefile 中的等价命令：
+
+```bash
+make docker-build
+make docker-up
+make docker-logs
 ```
 
 服务使用 Linux host 网络并仍然只监听 `127.0.0.1:8765`。这样既不会暴露到公网，又可以访问同样只监听宿主机 localhost 的 Agent 代理 `127.0.0.1:18766`。
@@ -199,6 +266,15 @@ Docker 版本出现问题时，可停止容器并恢复原来的 systemd 服务�
 docker-compose down
 systemctl --user start lark-ob-local.service
 ```
+
+### 5. 容器设计
+
+- `Dockerfile` 使用 Node 和 Go 两个构建阶段，最终镜像只保留运行时、编译后的 Go 二进制和 `lark-cli`。
+- React 产物通过 Go `embed` 打进二进制，不需要单独部署 Nginx。
+- 容器以 UID/GID `1000:1000` 的非 root 用户运行，根文件系统只读。
+- `/tmp` 使用限制大小的临时文件系统；SQLite、授权和图片缓存使用宿主机持久化目录。
+- `network_mode: host` 只用于当前 Linux 单机方案，让容器访问宿主机 localhost 上的模型代理。应用自身仍只监听 `127.0.0.1:8765`。
+- 健康检查只验证本地 HTTP 服务可响应，不把短暂同步状态误判为容器崩溃。
 
 ## 原生环境启动
 
@@ -362,6 +438,9 @@ GET  /api/initialization/status
 GET  /api/chats/{id}/memories
 POST /api/chats/{id}/memories/extract
 GET  /api/memories?subjectType=...&sourceChatType=...&q=...&limit=...&offset=...
+GET  /api/memories/subjects
+POST /api/memories
+PUT  /api/memories/{id}
 DELETE /api/memories/{id}
 POST /api/chats/{id}/recommendation
 GET  /api/knowledge/sources/{id}/summary
@@ -370,6 +449,101 @@ GET  /api/events
 GET  /auth/lark
 GET  /auth/lark/callback
 ```
+
+## 开发与修复指南
+
+### 推荐开发流程
+
+1. 先确认问题属于同步、存储、记忆、印象、知识库、Agent、HTTP 还是 UI，不要跨模块顺手重构。
+2. 用本地 API 或容器日志复现问题，记录会话 ID、消息 ID、时间戳和错误阶段；不要把真实消息正文复制进公开 Issue。
+3. 优先为对应模块补一个最小回归测试，再修改实现。
+4. 后端修改运行 `go test ./...`；前端修改运行 `npm run build`；跨层修改两项都要执行。
+5. Docker 相关修改必须重新构建镜像，并验证容器健康、授权、数据库和 Agent 状态。
+6. 只提交源代码和空配置模板，不提交本地数据库、授权目录、图片缓存或真实密钥。
+
+最小验证集合：
+
+```bash
+go test ./...
+cd internal/server/ui && npm run build && cd ../../..
+docker-compose build
+docker-compose up -d
+docker-compose ps
+curl --fail http://127.0.0.1:8765/api/status
+curl --fail http://127.0.0.1:8765/api/agent/status
+```
+
+### 后端开发
+
+- HTTP handler 只负责参数校验、状态码和调用领域服务。
+- 业务规则放在对应领域模块，SQL 只放在 `internal/store`。
+- 所有 schema 变化都通过幂等迁移完成，必须兼容已有 SQLite，不能要求用户删除数据库。
+- 消息排序必须同时使用 `created_at`、飞书 `message_position` 和稳定 ID 作为最终兜底。
+- 自动提炼只能替换 `source_type=agent` 的记忆，不能覆盖用户维护的手动记忆。
+- 消息盒子会话不参与自动记忆、印象和风格学习。
+- Agent Prompt 中的消息、文档和记忆都视为不可信资料，不能赋予其工具调用或系统指令权限。
+
+### 前端开发
+
+```bash
+cd internal/server/ui
+npm ci
+npm run dev     # Vite 开发服务器
+npm run build   # TypeScript 检查 + 生产构建
+```
+
+- API 类型和页面状态按 `inbox`、`agent`、`knowledge`、`memory` 分目录维护。
+- 聊天时间线是独立滚动容器；修改布局时必须验证默认定位底部和向上加载历史。
+- SSE 更新不得无条件重置用户滚动位置、筛选条件或正在编辑的推荐回复。
+- 新增可交互状态时必须覆盖 loading、empty、error、disabled 四种情况。
+- 生产页面来自嵌入式 `ui/dist`；修改前端后若只重启旧容器，页面不会变化，必须重新 build 镜像。
+
+### 数据库与测试数据
+
+开发测试使用 `t.TempDir()` 创建独立数据库，不要直接清空真实运行库。需要检查真实库时优先使用只读 API；确需迁移或修复前，先停止服务并备份整个数据目录。
+
+不要手工删除 SQLite 的 `-wal` 或 `-shm` 文件。它们必须与主数据库一起由 SQLite 正常关闭或一并备份。
+
+## 常见故障排查
+
+先执行下面的基础检查：
+
+```bash
+docker-compose ps
+docker-compose logs --tail 200 lark-ob
+curl --fail http://127.0.0.1:8765/api/status
+curl --fail http://127.0.0.1:8765/api/agent/status
+```
+
+| 现象 | 常见原因 | 检查和处理 |
+| --- | --- | --- |
+| 页面打不开 | 容器未启动、8765 被占用或 SSH 隧道断开 | 检查 `docker-compose ps`；确认没有同时运行 systemd 版本；重新建立 `ssh -L 63544:127.0.0.1:8765` |
+| 容器反复重启 | 环境文件缺失、挂载目录权限不对、数据库无法打开 | 查看容器日志；确认四个持久化目录属于 UID 1000；不要删除数据库重试 |
+| 页面还是旧版本 | 只重启了旧镜像或浏览器缓存未更新 | 执行 `docker-compose build && docker-compose up -d --force-recreate`，再强制刷新浏览器 |
+| `lark-cli: unknown flag: --as` | CLI 版本过旧或容器调用了错误路径 | 容器内执行 `lark-cli version`；当前验证版本为 1.0.93；重新构建镜像并确认 `LARK_CLI_PATH` |
+| 显示未授权或 token 无效 | 授权目录未挂载、master key 缺失或 token 过期 | 执行容器版 `lark-cli auth status --verify`；必须同时挂载 `.lark-cli` 和 `.local/share/lark-cli`，必要时重新登录 |
+| Agent 未启用 | `AGENT_API_KEY` 未注入或模型代理不可达 | 查看 `/api/agent/status`；确认 host 网络和 `127.0.0.1:18766` 代理正在运行；不要把代理开放到公网 |
+| 推荐回复很慢 | 模型代理排队、上下文尚未预生成或推理参数过高 | 检查 Agent 日志和 chat context 更新时间；回复使用 low reasoning，记忆任务可保留 medium |
+| 推荐内容违背现实条件 | 人物地点等事实没有进入目录资料或有效记忆 | 在记忆仓库补充带有效期的手动事实/硬约束；不要让模型从旧聊天猜测当前位置 |
+| 新消息没有出现 | 增量轮询还未扫描该会话或授权调用失败 | 点击会话主动刷新，检查 `/api/status` 和同步日志；不要仅靠全局 SSE 判断飞书是否有新消息 |
+| 消息顺序与飞书不同 | 时间戳相同但 position 缺失，或旧记录尚未回填 | 检查日志中的顺序回填错误；排序修复必须保留 position 和稳定 ID 兜底 |
+| 图片只显示 `img_...` | 图片缓存不可写、授权失效或消息资源权限不足 | 检查缓存挂载权限和授权状态；通过图片 API 复现，避免把原始图片写进仓库 |
+| SQLite locked | systemd 与 Docker 同时打开同一数据库，或异常工具持有写锁 | 保证只运行一个实例；优雅停止另一个进程后再重启容器；不要直接删除 WAL |
+| 记忆没有自动更新 | 初始化未完成、每日任务未到时间或会话位于消息盒子 | 查看 `/api/initialization/status`、`/api/profile-maintenance/status`；消息盒子被设计为不提炼记忆 |
+| “消息盒子”与飞书不一致 | 飞书内建消息盒子成员关系没有公开 OpenAPI | 当前仅支持本地手动状态，不要把“免打扰”误当作消息盒子 |
+
+### 修复后的交付标准
+
+每次修复至少说明：问题根因、改动模块、是否涉及数据库迁移、验证命令、运行态结果和回滚方法。涉及真实飞书接口时还要说明使用的用户/机器人身份和权限范围，但不能输出 token。
+
+## 数据安全与备份
+
+- 运行库默认是 `~/.local/share/lark-ob/lark-ob.db`，图片在 `~/.cache/lark-ob`。
+- 飞书 CLI 授权分别位于 `~/.lark-cli` 和 `~/.local/share/lark-cli`；二者都属于敏感数据。
+- 备份 SQLite 前先执行 `docker-compose down`，然后复制整个 `~/.local/share/lark-ob` 目录。
+- 恢复时也要先停止服务，并保留一份当前目录作为可回滚副本。
+- 不要把运行目录挂载到公网共享盘，不要把数据库或授权文件上传到 Issue、对象存储或代码仓库。
+- `.env.docker` 被 Git 忽略；仓库只保留不含密钥的 `.env.docker.example`。
 
 ## 当前验证状态
 
@@ -383,6 +557,8 @@ GET  /auth/lark/callback
 - 真实会话与消息可持续同步，运行数据库位于用户数据目录；仓库中没有 token、App Secret、聊天数据库或真实消息。
 - 知识库迁移、导入/检索接口契约、文档切分、FTS5 更新替换均通过自动化测试。
 - 新二进制已在 `127.0.0.1:8765` 运行验证，知识源列表与空检索接口返回正常。
+- Docker 多阶段镜像与 Compose 已完成真实构建和重启验证；容器以非 root、只读根文件系统运行，健康检查通过。
+- Docker 容器已复用宿主机加密授权目录，`lark-cli` 用户身份和 token 校验通过。
 - Eino + `grok-4.5` 已通过 dev 模型代理完成真实调用：记忆提取成功，回复 Agent 单次模型调用返回多条建议与证据。
 - 人物记忆跨会话聚合、群组来源保留、无效模型主体/证据过滤以及知识摘要持久化均有自动化测试。
 
